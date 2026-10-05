@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+events.jsonl
+incidents.json
+temp_incidents.json
+temp_uploaded_events.jsonl

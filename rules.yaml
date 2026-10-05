@@ -1,0 +1,41 @@
+# Rules configuration for AI Agent Threat Detection POC
+
+- rule_id: "AI001"
+  name: "Tool call volume spike"
+  type: "baseline-deviation"
+  metric: "call_count"
+  threshold_multiplier: 5
+  min_baseline_samples: 10
+  window_minutes: 60
+  severity: "high"
+  description: "Agent tool call volume exceeded 5x its historical average rolling baseline."
+
+- rule_id: "AI002"
+  name: "Token/API cost spike"
+  type: "baseline-deviation"
+  metric: "token_cost"
+  threshold_multiplier: 5
+  min_baseline_samples: 10
+  window_minutes: 60
+  severity: "high"
+  description: "Agent token cost consumption exceeded 5x its historical average rolling baseline."
+
+- rule_id: "AI003"
+  name: "Scope violation"
+  type: "scope-violation"
+  severity: "critical"
+  description: "Agent attempted to call a tool that is not in its allowed tools list."
+
+- rule_id: "AI004"
+  name: "Missing approval"
+  type: "missing-approval"
+  risk_scopes: ["financial", "data_deletion", "external_communication"]
+  severity: "medium"
+  description: "Agent executed a high-risk tool call without required human approval."
+
+- rule_id: "AI005"
+  name: "Memory poisoning"
+  type: "origin-mismatch"
+  untrusted_sources: ["external_document", "untrusted_tool_output"]
+  severity: "critical"
+  description: "Agent wrote to its memory from an untrusted source, which could lead to prompt injection."
