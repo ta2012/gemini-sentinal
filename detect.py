@@ -28,6 +28,9 @@
 
 # and recommending a response.
 
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 import os
@@ -250,227 +253,153 @@ def load_events(events_path):
 
 
 def check_baseline_deviation(
-
     agent_history,
-
     current_event,
-
     metric,
-
     threshold_multiplier,
-
-    min_baseline_samples
-
+    min_baseline_samples,
 ):
-
     """
-
-    Evaluate baseline deviation.
-
-
+    Evaluate baseline deviation while safely handling invalid telemetry.
 
     Historical period:
-
         Before the most recent 60-minute window.
 
-
-
     Current period:
+        The most recent 60-minute window.
 
-        Most recent 60-minute window.
-
+    Missing, nonnumeric, boolean, NaN, and infinite token costs
+    are excluded from token-cost calculations.
+    Call counts remain independent of token-cost validity.
     """
 
+    import math
 
+    def valid_number(value):
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+        )
 
-    t_curr = parse_timestamp(
+    # Validate timestamps before performing calculations.
+    try:
+        t_curr = parse_timestamp(current_event["timestamp"])
 
-        current_event["timestamp"]
+        valid_history = []
 
-    )
+        for event in agent_history:
+            timestamp = event.get("timestamp")
 
+            if not isinstance(timestamp, str):
+                continue
 
+            try:
+                event_time = parse_timestamp(timestamp)
+            except (ValueError, TypeError, AttributeError):
+                continue
 
-    t_start = parse_timestamp(
+            valid_history.append((event_time, event))
 
-        agent_history[0]["timestamp"]
+        if not valid_history:
+            return False, 0.0, 0.0, []
 
-    )
+        valid_history.sort(key=lambda item: item[0])
 
+        t_start = valid_history[0][0]
 
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return False, 0.0, 0.0, []
 
-    t_hist_end = t_curr - timedelta(
-
-        minutes=60
-
-    )
-
-
+    t_hist_end = t_curr - timedelta(minutes=60)
 
     if t_hist_end <= t_start:
-
         return False, 0.0, 0.0, []
 
-
-
-    total_seconds = (
-
-        t_hist_end - t_start
-
-    ).total_seconds()
-
-
-
-    num_bins = int(
-
-        total_seconds // 3600
-
-    )
-
-
+    total_seconds = (t_hist_end - t_start).total_seconds()
+    num_bins = int(total_seconds // 3600)
 
     if num_bins < min_baseline_samples:
-
         return False, 0.0, 0.0, []
 
+    bin_values = [0.0] * num_bins
 
+    # ---------------------------------------------------------
+    # Historical baseline
+    # ---------------------------------------------------------
 
-    bin_values = [0] * num_bins
+    for event_time, event in valid_history:
 
+        if event_time >= t_hist_end:
+            continue
 
-
-    for ev in agent_history:
-
-
-
-        t_ev = parse_timestamp(
-
-            ev["timestamp"]
-
+        bin_idx = int(
+            (event_time - t_start).total_seconds() // 3600
         )
 
+        if not (0 <= bin_idx < num_bins):
+            continue
 
+        if metric == "call_count":
+            value = 1
 
-        if t_ev < t_hist_end:
+        else:
+            value = event.get(metric)
 
+            if not valid_number(value):
+                continue
 
+        bin_values[bin_idx] += value
 
-            bin_idx = int(
-
-                (
-
-                    t_ev - t_start
-
-                ).total_seconds() // 3600
-
-            )
-
-
-
-            if 0 <= bin_idx < num_bins:
-
-
-
-                val = (
-
-                    1
-
-                    if metric == "call_count"
-
-                    else ev.get("token_cost", 0)
-
-                )
-
-
-
-                bin_values[bin_idx] += val
-
-
-
-    hist_avg = (
-
-        sum(bin_values) / num_bins
-
-    )
-
-
+    hist_avg = sum(bin_values) / num_bins
 
     if hist_avg <= 0:
+        return False, 0.0, hist_avg, []
 
-        return False, 0.0, 0.0, []
+    # ---------------------------------------------------------
+    # Current window
+    # ---------------------------------------------------------
 
+    curr_val = 0.0
+    matched_events = []
 
+    for event_time, event in valid_history:
 
-    curr_val = 0
+        if not (t_hist_end <= event_time <= t_curr):
+            continue
 
-    matched_evs = []
+        if metric == "call_count":
+            value = 1
 
+        else:
+            value = event.get(metric)
 
+            if not valid_number(value):
+                continue
 
-    for ev in agent_history:
+        curr_val += value
+        matched_events.append(event)
 
+    # ---------------------------------------------------------
+    # Threshold comparison
+    # ---------------------------------------------------------
 
+    threshold = threshold_multiplier * hist_avg
 
-        t_ev = parse_timestamp(
-
-            ev["timestamp"]
-
-        )
-
-
-
-        if t_hist_end <= t_ev <= t_curr:
-
-
-
-            val = (
-
-                1
-
-                if metric == "call_count"
-
-                else ev.get("token_cost", 0)
-
-            )
-
-
-
-            curr_val += val
-
-            matched_evs.append(ev)
-
-
-
-    if curr_val >= threshold_multiplier * hist_avg:
-
-
-
+    if curr_val >= threshold:
         return (
-
             True,
-
             curr_val,
-
             hist_avg,
-
-            matched_evs
-
+            matched_events,
         )
-
-
 
     return (
-
         False,
-
         curr_val,
-
         hist_avg,
-
-        []
-
+        [],
     )
-
 
 
 
@@ -876,208 +805,108 @@ def detect_findings(rules, events):
 
 
 def correlate_findings(
-
     findings,
-
-    correlation_window_minutes=60
-
+    correlation_window_minutes=60,
 ):
-
     """
+    Groups findings from the same agent into incidents.
 
-    Groups findings belonging to the same agent
+    A finding joins an incident only if it falls within the
+    configured window measured from that incident's start time.
 
-    and occurring within the correlation window.
-
+    This prevents repeated findings from extending a single
+    incident indefinitely.
     """
-
-
 
     if not findings:
-
         return []
 
-
-
     findings.sort(
-
-        key=lambda x: parse_timestamp(
-
-            x["timestamp"]
-
+        key=lambda finding: parse_timestamp(
+            finding["timestamp"]
         )
-
     )
 
-
-
-    global_incidents = []
-
+    incidents = []
     agent_incidents = {}
 
+    window_seconds = correlation_window_minutes * 60
 
-
-    for f in findings:
-
-
-
-        agent_id = f["agent_id"]
-
-
-
-        f_time = parse_timestamp(
-
-            f["timestamp"]
-
+    for finding in findings:
+        agent_id = finding["agent_id"]
+        finding_time = parse_timestamp(
+            finding["timestamp"]
         )
-
-
 
         matched_incident = None
 
-
-
-        if agent_id in agent_incidents:
-
-
-
-            for inc in reversed(
-
-                agent_incidents[agent_id]
-
-            ):
-
-
-
-                inc_end_time = parse_timestamp(
-
-                    inc["end_time"]
-
-                )
-
-
-
-                if (
-
-                    f_time - inc_end_time
-
-                ).total_seconds() <= (
-
-                    correlation_window_minutes * 60
-
-                ):
-
-
-
-                    matched_incident = inc
-
-                    break
-
-
-
-        if matched_incident:
-
-
-
-            matched_incident["findings"].append(f)
-
-
-
-            matched_incident["end_time"] = (
-
-                f["timestamp"]
-
+        # Inspect recent incidents for this agent.
+        for incident in reversed(
+            agent_incidents.get(agent_id, [])
+        ):
+            incident_start = parse_timestamp(
+                incident["start_time"]
             )
 
+            elapsed_seconds = (
+                finding_time - incident_start
+            ).total_seconds()
 
+            if 0 <= elapsed_seconds <= window_seconds:
+                matched_incident = incident
+                break
 
-            current_sev_rank = SEVERITY_MAP.get(
-
-                matched_incident["severity"].lower(),
-
-                0
-
+        if matched_incident is None:
+            incident_id = (
+                f"INC-{len(incidents) + 1:03d}"
             )
 
-
-
-            finding_sev_rank = SEVERITY_MAP.get(
-
-                f["severity"].lower(),
-
-                0
-
-            )
-
-
-
-            if finding_sev_rank > current_sev_rank:
-
-                matched_incident["severity"] = (
-
-                    f["severity"]
-
-                )
-
-
-
-        else:
-
-
-
-            inc_id = (
-
-                f"INC-{len(global_incidents) + 1:03d}"
-
-            )
-
-
-
-            new_inc = {
-
-                "incident_id": inc_id,
-
+            matched_incident = {
+                "incident_id": incident_id,
                 "agent_id": agent_id,
-
-                "severity": f["severity"],
-
-                "start_time": f["timestamp"],
-
-                "end_time": f["timestamp"],
-
-                "findings": [f],
-
-                "llm_summary": None
-
+                "severity": finding["severity"],
+                "start_time": finding["timestamp"],
+                "end_time": finding["timestamp"],
+                "findings": [],
+                "llm_summary": None,
             }
 
+            incidents.append(matched_incident)
 
+            agent_incidents.setdefault(
+                agent_id, []
+            ).append(matched_incident)
 
-            global_incidents.append(
+        # Add the finding to its incident.
+        matched_incident["findings"].append(
+            finding
+        )
 
-                new_inc
-
+        # Preserve the latest event timestamp.
+        if finding_time > parse_timestamp(
+            matched_incident["end_time"]
+        ):
+            matched_incident["end_time"] = (
+                finding["timestamp"]
             )
 
+        # Preserve the highest severity among findings.
+        current_rank = SEVERITY_MAP.get(
+            matched_incident["severity"].lower(),
+            0,
+        )
 
+        finding_rank = SEVERITY_MAP.get(
+            finding["severity"].lower(),
+            0,
+        )
 
-            if agent_id not in agent_incidents:
-
-                agent_incidents[agent_id] = []
-
-
-
-            agent_incidents[agent_id].append(
-
-                new_inc
-
+        if finding_rank > current_rank:
+            matched_incident["severity"] = (
+                finding["severity"]
             )
 
-
-
-    return global_incidents
-
-
+    return incidents
 
 
 
@@ -2053,7 +1882,7 @@ Use only the supplied events and findings.
 
     response = client.chat.completions.create(
 
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
 
         messages=[
 
